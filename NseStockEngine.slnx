@@ -1,0 +1,10 @@
+<Solution>
+  <Project Path="NseStock.Agent/NseStock.Agent.csproj" />
+  <Project Path="NseStock.Analysis/NseStock.Analysis.csproj" />
+  <Project Path="NseStock.Api/NseStock.Api.csproj" />
+  <Project Path="NseStock.DataValidation/NseStock.DataValidation.csproj" />
+  <Project Path="NseStock.DownloaderTest/NseStock.DownloaderTest.csproj" />
+  <Project Path="NseStock.IndicatorTest/NseStock.IndicatorTest.csproj" />
+  <Project Path="NseStock.Infrastructure/NseStock.Infrastructure.csproj" />
+  <Project Path="NseStock.LlmTest/NseStock.LlmTest.csproj" />
+</Solution>

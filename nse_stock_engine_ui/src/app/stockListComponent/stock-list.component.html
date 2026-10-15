@@ -1,0 +1,16 @@
+<h2>Stock Dashboard</h2>
+
+<input
+  type="text"
+  [ngModel]="searchText()"
+  (ngModelChange)="searchText.set($event)"
+  placeholder="Search stocks"
+/>
+
+<p>Total stocks: {{ filteredStocks().length }}</p>
+
+<ul>
+  @for (stock of filteredStocks(); track stock.symbol) {
+    <li>{{ stock.symbol }} - ₹{{ stock.price }}</li>
+  }
+</ul>
