@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\NseStock.Analysis\NseStock.Analysis.csproj" />
+    <Compile Remove="Program.cs" />
   </ItemGroup>
 
   <ItemGroup>

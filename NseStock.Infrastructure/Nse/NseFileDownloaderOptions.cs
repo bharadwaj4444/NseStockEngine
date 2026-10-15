@@ -14,5 +14,5 @@ public sealed class NseFileDownloaderOptions
         "https://nsearchives.nseindia.com/content/cm/";
 
     public string NiftyHistoryUrl { get; init; } =
-        "https://www.niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString";
+        "https://niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString";
 }

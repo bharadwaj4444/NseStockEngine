@@ -3,6 +3,7 @@ using System.Globalization;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 
 namespace NseStock.Infrastructure.Nse;
@@ -12,10 +13,7 @@ public sealed class NseFileDownloader(
     NseFileDownloaderOptions options)
 {
     private static readonly Uri NiftyHistoryPage =
-    new("https://www.niftyindices.com/reports/historical-data");
-
-    private static readonly Uri NiftyHistoryApi =
-        new("https://www.niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString");
+        new("https://niftyindices.com/reports/historical-data");
 
     private static readonly Dictionary<string, string> NiftyHeaders = new()
     {
@@ -29,20 +27,23 @@ public sealed class NseFileDownloader(
 
         ["Accept-Language"] = "en-US,en;q=0.9",
 
+        ["Origin"] = "https://niftyindices.com",
+
         ["Content-Type"] = "application/json; charset=UTF-8",
 
         ["X-Requested-With"] = "XMLHttpRequest",
 
-        ["Referer"] = "https://www.niftyindices.com/reports/historical-data"
+        ["Referer"] =
+            "https://niftyindices.com/reports/historical-data"
     };
-
-    private bool _niftySessionInitialized;
 
     private readonly HttpClient _httpClient =
         httpClient ?? throw new ArgumentNullException(nameof(httpClient));
 
     private readonly NseFileDownloaderOptions _options =
         options ?? throw new ArgumentNullException(nameof(options));
+
+    private bool _niftySessionInitialized;
 
     private string EquityDirectory =>
         Path.Combine(_options.RawDataDirectory, "equity");
@@ -70,15 +71,14 @@ public sealed class NseFileDownloader(
         int benchmarkDownloaded = 0;
         int benchmarkSkipped = 0;
 
-        var unavailableDates = await ReadUnavailableDatesAsync(
-            cancellationToken);
+        var unavailableDates =
+            await ReadUnavailableDatesAsync(cancellationToken);
 
-        // Equity archive: one ZIP file per trading date.
+        // Equity archive: one ZIP file per weekday.
         for (var date = fromDate; date <= toDate; date = date.AddDays(1))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // NSE does not publish daily equity bhavcopy on weekends.
             if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
             {
                 equitySkipped++;
@@ -121,12 +121,13 @@ public sealed class NseFileDownloader(
             }
         }
 
-        // NIFTY historical data: one cached JSON response per calendar month.
-        // A complete month is cached so later runs can skip it reliably.
-        var monthStart = new DateOnly(fromDate.Year, fromDate.Month, 1);
+        // NIFTY history: cache one response per calendar month.
+        // Requests cover the complete month, capped at today's date.
+        var firstMonth = new DateOnly(fromDate.Year, fromDate.Month, 1);
         var lastMonth = new DateOnly(toDate.Year, toDate.Month, 1);
+        var today = DateOnly.FromDateTime(DateTime.Today);
 
-        for (var month = monthStart; month <= lastMonth;
+        for (var month = firstMonth; month <= lastMonth;
              month = month.AddMonths(1))
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -134,20 +135,6 @@ public sealed class NseFileDownloader(
             var start = month;
             var end = month.AddMonths(1).AddDays(-1);
 
-            // Avoid requesting dates beyond the requested end or today.
-            if (start < fromDate)
-            {
-                // Keep a complete calendar-month cache for consistency.
-                // This may include dates earlier than fromDate.
-            }
-
-            if (end > toDate)
-            {
-                // Keep a complete calendar-month cache for consistency.
-                // This may include dates later than toDate.
-            }
-
-            var today = DateOnly.FromDateTime(DateTime.Today);
             if (end > today)
                 end = today;
 
@@ -195,21 +182,25 @@ public sealed class NseFileDownloader(
                 if (response.StatusCode is HttpStatusCode.NotFound
                     or HttpStatusCode.Gone)
                 {
-                    // Do not permanently cache a recent 404: NSE files can
-                    // appear later in the day.
                     var age = DateOnly.FromDateTime(DateTime.Today)
                         .DayNumber - date.DayNumber;
 
+                    // Recent files may appear later, so don't permanently
+                    // mark recent 404/410 responses as unavailable.
                     if (age > 7)
+                    {
                         await RecordUnavailableDateAsync(
                             date, cancellationToken);
+                    }
 
                     return EquityDownloadResult.Unavailable;
                 }
 
-                if ((int)response.StatusCode >= 500 && attempt < _options.MaxRetries)
+                if ((int)response.StatusCode >= 500
+                    && attempt < _options.MaxRetries)
                 {
-                    await DelayBeforeRetryAsync(attempt, cancellationToken);
+                    await DelayBeforeRetryAsync(
+                        attempt, cancellationToken);
                     continue;
                 }
 
@@ -225,7 +216,8 @@ public sealed class NseFileDownloader(
 
                 return EquityDownloadResult.Downloaded;
             }
-            catch (HttpRequestException) when (attempt < _options.MaxRetries)
+            catch (HttpRequestException)
+                when (attempt < _options.MaxRetries)
             {
                 await DelayBeforeRetryAsync(attempt, cancellationToken);
             }
@@ -248,27 +240,24 @@ public sealed class NseFileDownloader(
         string destination,
         CancellationToken cancellationToken)
     {
+        await EnsureNiftySessionAsync(cancellationToken);
+
         var startText = start.ToString(
             "dd-MMM-yyyy", CultureInfo.InvariantCulture);
 
         var endText = end.ToString(
             "dd-MMM-yyyy", CultureInfo.InvariantCulture);
 
-        // This endpoint expects cinfo to contain a JSON-like string.
+        // Match the Python payload: cinfo is a JSON string containing
+        // the single-quoted date parameters expected by this endpoint.
         var cinfo =
             $"{{'name':'NIFTY 50'," +
-            $"'startDate':'{start.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture)}'," +
-            $"'endDate':'{end.ToString("dd-MMM-yyyy", CultureInfo.InvariantCulture)}'," +
+            $"'startDate':'{startText}'," +
+            $"'endDate':'{endText}'," +
             $"'indexName':'NIFTY 50'}}";
 
-        var payload = JsonSerializer.Serialize(new
-        {
-            cinfo
-        });
-
+        var payload = JsonSerializer.Serialize(new { cinfo });
         var uri = new Uri(_options.NiftyHistoryUrl);
-
-        await EnsureNiftySessionAsync(cancellationToken);
 
         for (int attempt = 1; attempt <= _options.MaxRetries; attempt++)
         {
@@ -278,16 +267,12 @@ public sealed class NseFileDownloader(
                     HttpMethod.Post, uri);
 
                 request.Content = new StringContent(
-                    payload, System.Text.Encoding.UTF8, "application/json");
+                    payload,
+                    Encoding.UTF8,
+                    "application/json");
 
-                request.Headers.Accept.Add(
-                    new MediaTypeWithQualityHeaderValue("application/json"));
-
-                request.Headers.TryAddWithoutValidation(
-                    "X-Requested-With", "XMLHttpRequest");
-
-                request.Headers.Referrer = new Uri(
-                    "https://www.niftyindices.com/reports/historical-data");
+                // Apply the same headers used by the Python request.
+                AddNiftyHeaders(request);
 
                 using var response = await _httpClient.SendAsync(
                     request, cancellationToken);
@@ -295,7 +280,8 @@ public sealed class NseFileDownloader(
                 if ((int)response.StatusCode >= 500
                     && attempt < _options.MaxRetries)
                 {
-                    await DelayBeforeRetryAsync(attempt, cancellationToken);
+                    await DelayBeforeRetryAsync(
+                        attempt, cancellationToken);
                     continue;
                 }
 
@@ -304,52 +290,53 @@ public sealed class NseFileDownloader(
                 var json = await response.Content.ReadAsStringAsync(
                     cancellationToken);
 
-                var contentType = response.Content.Headers.ContentType?.MediaType;
+                var contentType =
+                    response.Content.Headers.ContentType?.MediaType;
 
-                Console.WriteLine($"NIFTY response URL: {response.RequestMessage?.RequestUri}");
-                Console.WriteLine($"NIFTY status: {(int)response.StatusCode} {response.StatusCode}");
-                Console.WriteLine($"NIFTY content type: {contentType}");
-                Console.WriteLine($"NIFTY response preview:\n{json[..Math.Min(json.Length, 1500)]}");
+                Console.WriteLine(
+                    $"NIFTY response URL: {response.RequestMessage?.RequestUri}");
 
-                if (contentType is not null &&
-                    !contentType.Contains("json", StringComparison.OrdinalIgnoreCase))
+                Console.WriteLine(
+                    $"NIFTY status: {(int)response.StatusCode} {response.StatusCode}");
+
+                Console.WriteLine(
+                    $"NIFTY content type: {contentType ?? "(missing)"}");
+
+                Console.WriteLine(
+                    $"NIFTY response preview:\n" +
+                    json[..Math.Min(json.Length, 1000)]);
+
+                if (contentType is null ||
+                    !contentType.Contains(
+                        "json", StringComparison.OrdinalIgnoreCase))
                 {
-                    var preview = json.Length > 250
-                        ? json[..250]
-                        : json;
-
                     throw new InvalidDataException(
-                        $"Expected JSON from NIFTY endpoint, received '{contentType}'. " +
-                        $"Response preview: {preview}");
-                }
-
-                if (!json.TrimStart().StartsWith("{", StringComparison.Ordinal))
-                {
-                    var preview = json.Length > 250
-                        ? json[..250]
-                        : json;
-
-                    throw new InvalidDataException(
-                        $"NIFTY endpoint did not return a JSON object. " +
-                        $"Response preview: {preview}");
+                        $"Expected JSON from NIFTY endpoint, received " +
+                        $"'{contentType ?? "(missing)"}'.");
                 }
 
                 ValidateNiftyResponse(json, start, end);
 
                 await WriteAtomicallyAsync(
                     destination,
-                    System.Text.Encoding.UTF8.GetBytes(json),
+                    Encoding.UTF8.GetBytes(json),
                     cancellationToken);
 
                 return;
             }
-            catch (HttpRequestException) when (attempt < _options.MaxRetries)
+            catch (HttpRequestException)
+                when (attempt < _options.MaxRetries)
             {
                 await DelayBeforeRetryAsync(attempt, cancellationToken);
             }
             catch (TaskCanceledException)
                 when (!cancellationToken.IsCancellationRequested
                       && attempt < _options.MaxRetries)
+            {
+                await DelayBeforeRetryAsync(attempt, cancellationToken);
+            }
+            catch (InvalidDataException)
+                when (attempt < _options.MaxRetries)
             {
                 await DelayBeforeRetryAsync(attempt, cancellationToken);
             }
@@ -361,11 +348,45 @@ public sealed class NseFileDownloader(
             $"{_options.MaxRetries} attempts.");
     }
 
+    private async Task EnsureNiftySessionAsync(
+        CancellationToken cancellationToken)
+    {
+        if (_niftySessionInitialized)
+            return;
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get, NiftyHistoryPage);
+
+        AddNiftyHeaders(request);
+
+        using var response = await _httpClient.SendAsync(
+            request, cancellationToken);
+
+        response.EnsureSuccessStatusCode();
+
+        _niftySessionInitialized = true;
+    }
+
+    private static void AddNiftyHeaders(HttpRequestMessage request)
+    {
+        foreach (var header in NiftyHeaders)
+        {
+            // StringContent sets Content-Type on the content headers.
+            if (header.Key.Equals(
+                "Content-Type", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            request.Headers.TryAddWithoutValidation(
+                header.Key, header.Value);
+        }
+    }
+
     private static void ValidateZip(byte[] bytes)
     {
         using var stream = new MemoryStream(bytes);
-        using var archive = new ZipArchive(
-            stream, ZipArchiveMode.Read);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
 
         if (archive.Entries.Count == 0)
             throw new InvalidDataException("NSE ZIP contains no entries.");
@@ -379,31 +400,63 @@ public sealed class NseFileDownloader(
         using var outer = JsonDocument.Parse(json);
 
         if (!outer.RootElement.TryGetProperty("d", out var dataElement))
+        {
             throw new InvalidDataException(
                 "NIFTY response does not contain the expected 'd' field.");
+        }
 
-        var dataText = dataElement.GetString();
+        // Python accepts either a JSON-encoded string or already-parsed data.
+        JsonDocument? innerDocument = null;
 
-        if (string.IsNullOrWhiteSpace(dataText) || dataText == "false")
-            throw new InvalidDataException(
-                "NIFTY endpoint returned no usable data.");
+        try
+        {
+            JsonElement rows;
 
-        using var inner = JsonDocument.Parse(dataText);
+            if (dataElement.ValueKind == JsonValueKind.String)
+            {
+                var dataText = dataElement.GetString();
 
-        if (inner.RootElement.ValueKind != JsonValueKind.Array)
-            throw new InvalidDataException(
-                "NIFTY response data is not a JSON array.");
+                if (string.IsNullOrWhiteSpace(dataText) ||
+                    dataText.Equals("false", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException(
+                        "NIFTY endpoint returned no usable data.");
+                }
 
-        if (inner.RootElement.GetArrayLength() == 0)
-            throw new InvalidDataException(
-                $"NIFTY endpoint returned no rows for {start} to {end}.");
+                innerDocument = JsonDocument.Parse(dataText);
+                rows = innerDocument.RootElement;
+            }
+            else
+            {
+                rows = dataElement;
+            }
 
-        var hasClose = inner.RootElement.EnumerateArray().Any(
-            item => item.TryGetProperty("CLOSE", out _));
+            if (rows.ValueKind != JsonValueKind.Array)
+            {
+                throw new InvalidDataException(
+                    "NIFTY response data is not a JSON array.");
+            }
 
-        if (!hasClose)
-            throw new InvalidDataException(
-                "NIFTY response rows do not contain CLOSE values.");
+            if (rows.GetArrayLength() == 0)
+            {
+                throw new InvalidDataException(
+                    $"NIFTY endpoint returned no rows for {start} to {end}.");
+            }
+
+            bool hasClose = rows.EnumerateArray().Any(item =>
+                item.ValueKind == JsonValueKind.Object &&
+                item.TryGetProperty("CLOSE", out _));
+
+            if (!hasClose)
+            {
+                throw new InvalidDataException(
+                    "NIFTY response rows do not contain CLOSE values.");
+            }
+        }
+        finally
+        {
+            innerDocument?.Dispose();
+        }
     }
 
     private async Task<HashSet<DateOnly>> ReadUnavailableDatesAsync(
@@ -415,12 +468,14 @@ public sealed class NseFileDownloader(
             return dates;
 
         foreach (var line in await File.ReadAllLinesAsync(
-                     UnavailableDatesFile, cancellationToken))
+            UnavailableDatesFile, cancellationToken))
         {
             if (DateOnly.TryParseExact(
-                    line, "yyyy-MM-dd",
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out var date))
+                line,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var date))
             {
                 dates.Add(date);
             }
@@ -435,8 +490,9 @@ public sealed class NseFileDownloader(
     {
         await File.AppendAllTextAsync(
             UnavailableDatesFile,
-            date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-                + Environment.NewLine,
+            date.ToString(
+                "yyyy-MM-dd", CultureInfo.InvariantCulture)
+            + Environment.NewLine,
             cancellationToken);
     }
 
@@ -471,46 +527,6 @@ public sealed class NseFileDownloader(
         Downloaded,
         Unavailable
     }
-
-    private async Task EnsureNiftySessionAsync(
-    CancellationToken cancellationToken)
-    {
-        if (_niftySessionInitialized)
-            return;
-
-        using var request = new HttpRequestMessage(
-            HttpMethod.Get,
-            NiftyHistoryPage);
-
-        AddNiftyHeaders(request);
-
-        using var response = await _httpClient.SendAsync(
-            request,
-            cancellationToken);
-
-        response.EnsureSuccessStatusCode();
-
-        _niftySessionInitialized = true;
-    }
-
-    private static void AddNiftyHeaders(
-        HttpRequestMessage request)
-    {
-        foreach (var header in NiftyHeaders)
-        {
-            if (header.Key.Equals(
-                    "Content-Type",
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            request.Headers.TryAddWithoutValidation(
-                header.Key,
-                header.Value);
-        }
-    }
-
 }
 
 public sealed record NseDownloadReport(
@@ -518,5 +534,4 @@ public sealed record NseDownloadReport(
     int EquityFilesSkipped,
     int EquityDatesUnavailable,
     int BenchmarkFilesDownloaded,
-    int BenchmarkFilesSkipped
-    );
+    int BenchmarkFilesSkipped);
